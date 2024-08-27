@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -15,10 +16,11 @@ import (
 )
 
 var (
-	sourceDir      string
-	backupDir      string
-	schedulePeriod time.Duration
-	includePaths   []string
+	sourceDir              string
+	backupDir              string
+	schedulePeriod         time.Duration
+	includePatterns        []string
+	maxConcurrentTransfers int
 )
 
 var backupCmd = &cobra.Command{
@@ -35,9 +37,8 @@ Supports both real-time file watching and scheduled sync operations.`,
 			runRealTimeSync()
 		}
 	},
-	Example: `  gorsync backup --source=/home/user/data --destination=/mnt/backup --interval=1h
-  gorsync backup -s /path/to/source -d /path/to/destination
-  gorsync backup -s /path/to/source -d /path/to/destination -i 30m --include=filename1.txt,folder1`,
+	Example: `  gorsync backup --source=/home/user/data --destination=/mnt/backup --interval=1h --include="*.txt,backup*" --max-transfers=5
+  gorsync backup -s /path/to/source -d /path/to/destination -i 30m --include="*.jpg,*.png" --max-transfers=3`,
 }
 
 func init() {
@@ -45,7 +46,8 @@ func init() {
 	backupCmd.Flags().StringVarP(&sourceDir, "source", "s", "", "Source directory (required)")
 	backupCmd.Flags().StringVarP(&backupDir, "destination", "d", "", "Backup directory (required)")
 	backupCmd.Flags().DurationVarP(&schedulePeriod, "interval", "i", 0, "Schedule interval for backups (e.g., 1h, 30m). If omitted, real-time sync will be used.")
-	backupCmd.Flags().StringArrayVarP(&includePaths, "include", "c", nil, "Comma-separated list of file or folder names to sync (optional)")
+	backupCmd.Flags().StringSliceVarP(&includePatterns, "include", "e", nil, "Comma-separated list of file or folder patterns to include for synchronization (e.g., *.jpg,backup*)")
+	backupCmd.Flags().IntVarP(&maxConcurrentTransfers, "max-transfers", "m", 1, "Maximum number of concurrent file transfers (default is 1)")
 
 	backupCmd.MarkFlagRequired("source")
 	backupCmd.MarkFlagRequired("destination")
@@ -53,7 +55,7 @@ func init() {
 
 func runScheduledBackup() {
 	fmt.Printf("Starting scheduled backup at %s\n", time.Now().Format("2006-01-02 15:04:05"))
-	err := syncDirectories(sourceDir, backupDir, includePaths)
+	err := syncDirectories(sourceDir, backupDir)
 	if err != nil {
 		fmt.Printf("Error during scheduled backup: %v\n", err)
 	} else {
@@ -71,33 +73,22 @@ func runRealTimeSync() {
 	}
 	defer watcher.Close()
 
-	var pathsToWatch []string
-	if len(includePaths) > 0 {
-		for _, includePath := range includePaths {
-			absPath, err := filepath.Abs(filepath.Join(sourceDir, includePath))
-			if err != nil {
-				fmt.Println("Error getting absolute path:", err)
-				return
-			}
-			pathsToWatch = append(pathsToWatch, absPath)
+	err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-	} else {
-		err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+
+		if info.IsDir() {
+			err = watcher.Add(path)
 			if err != nil {
 				return err
 			}
-			if info.IsDir() {
-				err = watcher.Add(path)
-				if err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			fmt.Println("Error walking source directory:", err)
-			return
 		}
+		return nil
+	})
+	if err != nil {
+		fmt.Println("Error walking source directory:", err)
+		return
 	}
 
 	done := make(chan bool)
@@ -108,17 +99,15 @@ func runRealTimeSync() {
 				if !ok {
 					return
 				}
-				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
-					if shouldWatch(event.Name, includePaths) {
-						fmt.Println("Detected modification:", event.Name)
-						relPath, err := filepath.Rel(sourceDir, event.Name)
-						if err != nil {
-							fmt.Println("Error getting relative path:", err)
-							continue
-						}
-						destPath := filepath.Join(backupDir, relPath)
-						copyFileWithProgress(event.Name, destPath)
+				if (event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create) && shouldInclude(event.Name) {
+					fmt.Println("Detected modification:", event.Name)
+					relPath, err := filepath.Rel(sourceDir, event.Name)
+					if err != nil {
+						fmt.Println("Error getting relative path:", err)
+						continue
 					}
+					destPath := filepath.Join(backupDir, relPath)
+					copyFileWithProgress(event.Name, destPath)
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -132,19 +121,13 @@ func runRealTimeSync() {
 	<-done
 }
 
-func syncDirectories(src, dst string, includes []string) error {
-	includeMap := make(map[string]bool)
-	for _, includePath := range includes {
-		includeMap[includePath] = true
-	}
+func syncDirectories(src, dst string) error {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentTransfers)
 
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
-		}
-
-		if len(includeMap) > 0 && !matchesAnyInclude(path, includes) {
-			return nil
 		}
 
 		relPath, err := filepath.Rel(src, path)
@@ -161,37 +144,24 @@ func syncDirectories(src, dst string, includes []string) error {
 				}
 			}
 		} else {
-			if shouldCopyFile(path, destPath, info) {
-				err := copyFileWithProgress(path, destPath)
-				if err != nil {
-					return err
-				}
+			if shouldCopyFile(path, destPath, info) && shouldInclude(path) {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(src, dst string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					err := copyFileWithProgress(src, dst)
+					if err != nil {
+						fmt.Println("Error copying file:", err)
+					}
+				}(path, destPath)
 			}
 		}
 
 		return nil
 	})
-}
-
-func matchesAnyInclude(path string, includes []string) bool {
-	for _, include := range includes {
-		if strings.Contains(filepath.Base(path), include) || strings.Contains(filepath.Dir(path), include) {
-			return true
-		}
-	}
-	return false
-}
-
-func shouldWatch(path string, includes []string) bool {
-	if len(includes) == 0 {
-		return true
-	}
-	for _, include := range includes {
-		if strings.Contains(filepath.Base(path), include) || strings.Contains(filepath.Dir(path), include) {
-			return true
-		}
-	}
-	return false
+	wg.Wait()
+	return nil
 }
 
 func shouldCopyFile(src, dst string, srcInfo os.FileInfo) bool {
@@ -203,6 +173,18 @@ func shouldCopyFile(src, dst string, srcInfo os.FileInfo) bool {
 		return false
 	}
 	return srcInfo.ModTime().After(dstInfo.ModTime())
+}
+
+func shouldInclude(path string) bool {
+	if len(includePatterns) == 0 {
+		return true
+	}
+	for _, pattern := range includePatterns {
+		if strings.Contains(filepath.Base(path), pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func copyFileWithProgress(src, dst string) error {
@@ -244,10 +226,7 @@ func copyFileWithProgress(src, dst string) error {
 
 	// Finalize the progress bar and print final time taken
 	elapsedTime := time.Since(startTime)
-	formattedElapsedTime := fmt.Sprintf("%.2f seconds", elapsedTime.Seconds())
-
-	// Move cursor to the beginning of the line and print the final progress
-	fmt.Printf("\rCopying %s 100%% |%s| (%s) %s\n", filepath.Base(src), bar.String(), formatBytesPerSecond(srcInfo.Size(), elapsedTime), formattedElapsedTime)
+	fmt.Printf("\nCopying %s 100%% |%s| (%.2f MB/s) %.2f seconds\n", filepath.Base(src), bar.String(), calculateMBPerSecond(srcInfo.Size(), elapsedTime), float64(elapsedTime.Seconds()))
 
 	// Ensure file permissions are copied
 	err = dstFile.Sync()
@@ -258,10 +237,9 @@ func copyFileWithProgress(src, dst string) error {
 	return os.Chmod(dst, srcInfo.Mode())
 }
 
-func formatBytesPerSecond(size int64, elapsed time.Duration) string {
+func calculateMBPerSecond(size int64, elapsed time.Duration) float64 {
 	if elapsed.Seconds() == 0 {
-		return "0 MB/s"
+		return 0
 	}
-	mbps := float64(size) / (1024 * 1024) / elapsed.Seconds()
-	return fmt.Sprintf("%.2f MB/s", mbps)
+	return float64(size) / (elapsed.Seconds() * 1024 * 1024)
 }

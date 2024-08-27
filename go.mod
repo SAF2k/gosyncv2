@@ -7,6 +7,7 @@ require (
 	github.com/go-co-op/gocron v1.37.0
 	github.com/schollz/progressbar/v3 v3.14.6
 	github.com/spf13/cobra v1.8.1
+	golang.org/x/sync v0.8.0
 )
 
 require (
